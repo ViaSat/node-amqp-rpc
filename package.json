@@ -5,7 +5,7 @@
     "amqp",
     "rpc"
   ],
-  "version": "0.0.8",
+  "version": "0.1.0",
   "preferGlobal": true,
   "author": {
     "name": "Eugene Demchenko"
@@ -28,7 +28,7 @@
     }
   ],
   "dependencies": {
-    "amqp": "0.2.0",
+    "amqp-coffee": "0.1.28",
     "node-uuid": "*",
     "debug": "~0.7.2"
   },

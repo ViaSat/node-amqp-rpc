@@ -1,6 +1,6 @@
 
 
-var amqp = require('amqp');
+var amqp = require('amqp-coffee');
 var uuid = require('node-uuid').v4;
 var os   = require('os');
 var debug= require('debug')('amqp-rpc');
@@ -15,7 +15,6 @@ function rpc(opt)   {
     this.__exchange         = opt.exchangeInstance ? opt.exchangeInstance : null;
     this.__exchange_name    = opt.exchange ? opt.exchange : 'rpc_exchange';
     this.__exchange_options = opt.exchange_options ? opt.exchange_options : {exclusive: false, autoDelete: true };
-    this.__impl_options     = opt.ipml_options || {defaultExchangeName: this.__exchange_name};
     this.__conn_options     = opt.conn_options || {};
 
     this.__results_queue = null;
@@ -46,14 +45,11 @@ rpc.prototype._connect = function(cb)  {
     }
 
     if(this.__conn) {
-
         if(this.__connCbs.length > 0)    {
-
                 this.__connCbs.push(cb);
 
             return true;
         }
-
         return cb(this.__conn);
     } else {
         this.__conn = this.opt.connection ? this.opt.connection : null;
@@ -64,10 +60,9 @@ rpc.prototype._connect = function(cb)  {
     this.__connCbs.push(cb);
     var options = this.__conn_options;
     if(!options.url && !options.host) options.url = this.__url;
-    debug("createConnection options=", options, ', ipml_options=', this.__impl_options || {});
-    this.__conn = amqp.createConnection(
-      options,
-        this.__impl_options
+    debug("createConnection options=", options || {});
+    this.__conn = new amqp(
+      options
     );
 
     this.__conn.on('ready', function() {
@@ -87,7 +82,7 @@ rpc.prototype._connect = function(cb)  {
 rpc.prototype.disconnect = function()   {
     debug("disconnect()");
     if(!this.__conn) return;
-    this.__conn.end();
+    this.__conn.close();
     this.__conn = null;
 }
 
@@ -117,15 +112,15 @@ rpc.prototype._makeExchange = function(cb) {
    * Otherwise we had an error in library node-amqp version > 0.1.7.
    * Text of such error: "PRECONDITION_FAILED - cannot redeclare exchange '<exchange name>' in vhost '/' with different type, durable, internal or autodelete value"
    */
-    this.__exchange = this.__conn.exchange(this.__exchange_name, { autoDelete: false }, function(exchange)    {
-        debug('Exchange ' + exchange.name + ' is open');
+    this.__exchange = this.__conn.exchange({exchange: this.__exchange_name, autoDelete: false }).declare(function(err, exchange){
+		debug('Exchange ' + $this.__exchange_name + ' is open');
         var cbs = $this.__exchangeCbs;
         $this.__exchangeCbs = [];
 
         for(var i=0; i< cbs.length; i++)    {
             cbs[i]($this.__exchange);
         }
-    });
+	});
 
 }
 
@@ -149,49 +144,45 @@ rpc.prototype._makeResultsQueue = function(cb) {
     this.__results_queue_name = this.generateQueueName('callback');
     this.__make_results_cb.push(cb);
 
-    $this._makeExchange(function()   {
+	$this._makeExchange(function()   {
+		$this.__exchange_options.queue = $this.__results_queue_name;
+		$this.__conn.queue($this.__exchange_options, function(error, q) {
+			$this.__results_queue = q.declare(function(err, res){
+				debug('Callback queue ' + q.queueOptions.queue + ' is open');
+				$this.__conn.consume(q.queueOptions.queue, {},function(){$this.__onResult.apply($this, arguments);});
+				q.bind($this.__exchange_name, $this.__results_queue_name, $this.__results_queue_name, function(err, res){
+					debug('Bind queue ' + q.queueOptions.queue + ' to exchange ' + $this.__exchange_name);
+					var cbs = $this.__make_results_cb;
+					$this.__make_results_cb = [];
 
-        $this.__results_queue = $this.__conn.queue(
-            $this.__results_queue_name,
-            $this.__exchange_options,
-            function(queue) {
-                debug('Callback queue ' + queue.name + ' is open');
-                queue.subscribe(function()   {
-                    $this.__onResult.apply($this, arguments);
-                });
-
-                queue.bind($this.__exchange, $this.__results_queue_name);
-                debug('Bind queue ' + queue.name + ' to exchange ' + $this.__exchange.name);
-                var cbs = $this.__make_results_cb;
-                $this.__make_results_cb = [];
-
-                for(var i=0; i<cbs.length; i++){
-                    cbs[i](queue);
-                }
-            }
-        );
-    });
+					for(var i=0; i<cbs.length; i++){
+					   	cbs[i](q);
+					}
+				});
+			});
+		});
+	});
 }
 
-rpc.prototype.__onResult = function(message, headers, deliveryInfo)   {
+rpc.prototype.__onResult = function(packet)   {
     debug("__onResult()");
-    if(! this.__results_cb[ deliveryInfo.correlationId ]) return;
+	if(! this.__results_cb[ packet.properties.correlationId ]) return;
 
-    var cb = this.__results_cb[ deliveryInfo.correlationId ];
+    var cb = this.__results_cb[ packet.properties.correlationId ];
 
     var args = [];
-    if(Array.isArray(message) ) {
+    if(Array.isArray(packet.data) ) {
 
-      for(var i=0; i< message.length; i++)   {
-          args.push(message[i]);
+      for(var i=0; i< packet.data.length; i++)   {
+          args.push(packet.data[i]);
       }
     }
-    else args.push(message);
+    else args.push(packet.data);
 
     cb.cb.apply(cb.context, args);
 
     if(cb.autoDeleteCallback !== false)
-        delete this.__results_cb[ deliveryInfo.correlationId ];
+        delete this.__results_cb[ packet.properties.correlationId ];
 }
 
 /**
@@ -206,20 +197,14 @@ rpc.prototype.__onResult = function(message, headers, deliveryInfo)   {
 rpc.prototype.call = function(cmd, params, cb, context, options) {
     debug('call()', cmd);
     var $this   = this;
-
     if(!options) options = {};
-
     options.contentType = 'application/json';
     var corr_id = options.correlationId || uuid();
 
     this._connect(function() {
-
         if(cb)  {
-
             $this._makeExchange(function(){
-
                 $this._makeResultsQueue(function()   {
-
                     $this.__results_cb[ corr_id ] = {
                         cb: cb,
                         context: context,
@@ -230,11 +215,11 @@ rpc.prototype.call = function(cmd, params, cb, context, options) {
                     options.mandatory = true;
                     options.replyTo   = $this.__results_queue_name;
                     options.correlationId = corr_id;
-                    //options.domain    = "localhost";
-
-                    $this.__exchange.publish(
+					//options.domain    = "localhost";
+                    $this.__conn.publish(
+						$this.__exchange_name,
                         cmd,
-                        params,
+                        new Buffer(JSON.stringify(params, 'utf8')),
                         options,
                         function(err)   {
                             if(err) {
@@ -252,9 +237,10 @@ rpc.prototype.call = function(cmd, params, cb, context, options) {
 
             $this._makeExchange(function(){
 
-                $this.__exchange.publish(
+                $this.__conn.publish(
+					$this.__exchange_name,
                     cmd,
-                    params,
+                    JSON.stringify(params),
                     options
                 );
             });
@@ -288,48 +274,50 @@ rpc.prototype.call = function(cmd, params, cb, context, options) {
 
 
 rpc.prototype.on = function(cmd, cb, context, options)    {
-    debug('on(), routingKey=%s', cmd);
-    if(this.__cmds[ cmd ]) return false;
-    options || (options = {});
+	debug('on(), routingKey=%s', cmd);
+	if(this.__cmds[ cmd ]) return false;
+	options || (options = {});
 
-    var $this = this;
+	var $this = this;
 
-    this._connect(function()    {
+	this._connect(function()    {
 
-        $this.__conn.queue(options.queueName || cmd, function(queue) {
-            $this.__cmds[ cmd ] = { queue: queue };
-            queue.subscribe(function(message, d, headers, deliveryInfo)  {
+        $this.__conn.queue({queue: options.queueName || cmd}, function(q) {
+			q.declare(function(err, res){
+				
+				$this.__cmds[ cmd ] = { queue: q };
+            	$this.__conn.consume(q.queueOptions.queue, function(packet)  {
 
-                var cmdInfo = {
-                    cmd:         deliveryInfo.routingKey,
-                    exchange:    deliveryInfo.exchange,
-                    contentType: deliveryInfo.contentType,
-                    size:        deliveryInfo.size
-                };
+                	var cmdInfo = {
+                    	cmd:         packet.routingKey,
+                    	exchange:    packet.exchange,
+                    	contentType: packet.properties.contentType,
+                    	size:        packet.size
+                	};
 
-                if(deliveryInfo.correlationId &&  deliveryInfo.replyTo )    {
+                	if(packet.properties.correlationId &&  packet.properties.replyTo )    {
 
-                    return cb.call(context, message, function(err, data)   {
+                	    return cb.call(context, message, function(err, data)   {
 
-                        var options = {
-                            correlationId: deliveryInfo.correlationId
-                        }
+                    	    var options = {
+                    	        correlationId: deliveryInfo.correlationId
+                    	    }
 
-                        $this.__exchange.publish(
-                            deliveryInfo.replyTo,
-                            Array.prototype.slice.call(arguments),
-                            options
-                        );
-                    }, cmdInfo);
-                }
-                else
-                    return cb.call(context, message, null, cmdInfo);
-            });
+                    	    $this.__exchange.publish(
+                        	    packet.properties.replyTo,
+                            	Array.prototype.slice.call(arguments),
+                            	options
+                        	);
+                    	}, cmdInfo);
+                	}
+                	else
+                    	return cb.call(context, message, null, cmdInfo);
+            	});
 
-            $this._makeExchange(function(){
-                queue.bind($this.__exchange, cmd);
-            });
-
+            	$this._makeExchange(function(){
+                	q.bind($this.__exchange_name, cmd);
+            	});
+			});
         });
     });
 
@@ -350,43 +338,12 @@ rpc.prototype.off = function(cmd)    {
     var $this = this;
     var c = $this.__cmds[ cmd ];
 
-    function unsubscribe(cb)    {
-        if(c.ctag)
-            c.queue.unsubscribe(c.ctag);
-
-        if(cb)
-            return cb();
-    }
-
-    function unbind(cb)    {
-
-        if(c.queue) {
-            unsubscribe(function() {
-                c.queue.unbind($this.__exchange, cmd);
-
-                if(cb)
-                    return cb();
-            });
-
-        }
-    }
-
-    function destroy(cb)    {
-
-        if(c.queue){
-            unbind(function(){
-                c.queue.destroy()
-
-                if(cb)
-                    return cb();
-            });
-        }
-    }
-
-    destroy(function(){
-        delete $this.__cmds[ cmd ];
-    });
-
+	if(c.queue){
+		c.queue.unbind($this.__exchange, cmd, function(){
+			c.queue.delete();
+			delete $this.__cmds[ cmd ];
+		});
+	}
     return true;
 }
 
